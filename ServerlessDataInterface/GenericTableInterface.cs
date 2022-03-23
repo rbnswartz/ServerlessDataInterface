@@ -13,7 +13,7 @@ namespace TestTableStorageOutput
 {
     public static class GenericTableInterface
     { 
-        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey)
+        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey, List<string> booleanFields = null)
         {
             if (req.Method == "POST")
             {
@@ -46,10 +46,26 @@ namespace TestTableStorageOutput
                 var output = new List<Dictionary<string, object>>();
                 var query = new TableQuery<DynamicTableEntity>();
                 string filter = string.Empty;
+                var filters = new List<string>();
                 foreach(var (queryItemKey, queryItem) in req.Query)
                 {
                     if (queryItemKey.StartsWith("_"))
                     {
+                        continue;
+                    }
+                    if (queryItemKey.EndsWith("_ne"))
+                    {
+                        filters.Add(TableQuery.GenerateFilterCondition(queryItemKey[..^3], QueryComparisons.NotEqual, queryItem[0]));
+                        continue;
+                    }
+                    if (queryItemKey.EndsWith("_gte"))
+                    {
+                        filters.Add(TableQuery.GenerateFilterCondition(queryItemKey[..^4], QueryComparisons.GreaterThanOrEqual, queryItem[0]));
+                        continue;
+                    }
+                    if (queryItemKey.EndsWith("_lte"))
+                    {
+                        filters.Add(TableQuery.GenerateFilterCondition(queryItemKey[..^4], QueryComparisons.LessThanOrEqual, queryItem[0]));
                         continue;
                     }
                     if (queryItemKey == "id")
@@ -66,11 +82,17 @@ namespace TestTableStorageOutput
                                 tmpFilter = TableQuery.CombineFilters(tmpFilter, TableOperators.Or, TableQuery.GenerateFilterCondition("RowKey", QueryComparisons.Equal, item));
                             }
                         }
-                        query.Where(tmpFilter);
+                        filters.Add(tmpFilter);
                         continue;
                     }
-                    query.Where(TableQuery.GenerateFilterCondition(queryItemKey, QueryComparisons.Equal, queryItem[0]));
+                    if (booleanFields != null && booleanFields.Contains(cloudTable.Name + ":" + queryItemKey) && bool.TryParse(queryItem[0], out bool parsedBool))
+                    {
+                        filters.Add(TableQuery.GenerateFilterConditionForBool(queryItemKey, QueryComparisons.Equal, parsedBool));
+                        continue;
+                    }
+                    filters.Add(TableQuery.GenerateFilterCondition(queryItemKey, QueryComparisons.Equal, queryItem[0]));
                 }
+                query.Where(string.Join(" and ", filters));
                 foreach (var item in cloudTable.ExecuteQuery(query))
                 {
                     output.Add(ConvertFromTableEntity(item));
@@ -89,6 +111,7 @@ namespace TestTableStorageOutput
                         return new OkObjectResult(output.OrderBy(i => i.ContainsKey(orderKey) ? i[orderKey] : null));
                     }
                 }
+
                 return new OkObjectResult(output);
             }
             else if (req.Method == "DELETE")
