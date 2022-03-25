@@ -165,7 +165,11 @@ namespace TestTableStorageOutput
             }
             if (typeHints[fieldName] == TypeHints.Date && DateTime.TryParse( value, out DateTime parsedDate))
             {
-                TableQuery.GenerateFilterConditionForDate(fieldName, comparison, parsedDate);
+                return TableQuery.GenerateFilterConditionForDate(fieldName, comparison, parsedDate);
+            }
+            if (typeHints[fieldName] == TypeHints.Integer && int.TryParse( value, out int parsedInt))
+            {
+                return TableQuery.GenerateFilterConditionForInt(fieldName, comparison, parsedInt);
             }
 
             return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
@@ -236,5 +240,6 @@ namespace TestTableStorageOutput
     {
         Boolean,
         Date,
+        Integer,
     }
 }
