@@ -13,8 +13,10 @@ namespace TestTableStorageOutput
 {
     public static class GenericTableInterface
     { 
-        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey, List<string> booleanFields = null)
+        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey, Dictionary<string,Dictionary<string,TypeHints>> typeHints)
         {
+            var currentTableHints = typeHints.ContainsKey(cloudTable.Name) ? typeHints[cloudTable.Name] : new Dictionary<string, TypeHints>();
+
             if (req.Method == "POST")
             {
                 string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
@@ -43,6 +45,9 @@ namespace TestTableStorageOutput
                     return new OkObjectResult(ConvertFromTableEntity((DynamicTableEntity)result.Result));
                 }
                 // Get all
+
+                // Add total count so that the application knows what the total amount is
+                req.HttpContext.Response.Headers.Add("Access-Control-Expose-Headers", "x-total-count");
                 var output = new List<Dictionary<string, object>>();
                 var query = new TableQuery<DynamicTableEntity>();
                 string filter = string.Empty;
@@ -55,17 +60,17 @@ namespace TestTableStorageOutput
                     }
                     if (queryItemKey.EndsWith("_ne"))
                     {
-                        filters.Add(TableQuery.GenerateFilterCondition(queryItemKey[..^3], QueryComparisons.NotEqual, queryItem[0]));
+                        filters.Add(BuildQueryComponent(queryItemKey[..^3], QueryComparisons.NotEqual, queryItem[0], currentTableHints));
                         continue;
                     }
                     if (queryItemKey.EndsWith("_gte"))
                     {
-                        filters.Add(TableQuery.GenerateFilterCondition(queryItemKey[..^4], QueryComparisons.GreaterThanOrEqual, queryItem[0]));
+                        filters.Add(BuildQueryComponent(queryItemKey[..^4], QueryComparisons.GreaterThanOrEqual, queryItem[0], currentTableHints));
                         continue;
                     }
                     if (queryItemKey.EndsWith("_lte"))
                     {
-                        filters.Add(TableQuery.GenerateFilterCondition(queryItemKey[..^4], QueryComparisons.LessThanOrEqual, queryItem[0]));
+                        filters.Add(BuildQueryComponent(queryItemKey[..^4], QueryComparisons.LessThanOrEqual, queryItem[0], currentTableHints));
                         continue;
                     }
                     if (queryItemKey == "id")
@@ -85,18 +90,17 @@ namespace TestTableStorageOutput
                         filters.Add(tmpFilter);
                         continue;
                     }
-                    if (booleanFields != null && booleanFields.Contains(cloudTable.Name + ":" + queryItemKey) && bool.TryParse(queryItem[0], out bool parsedBool))
-                    {
-                        filters.Add(TableQuery.GenerateFilterConditionForBool(queryItemKey, QueryComparisons.Equal, parsedBool));
-                        continue;
-                    }
-                    filters.Add(TableQuery.GenerateFilterCondition(queryItemKey, QueryComparisons.Equal, queryItem[0]));
+                    filters.Add(BuildQueryComponent(queryItemKey, QueryComparisons.Equal, queryItem[0], currentTableHints));
                 }
                 query.Where(string.Join(" and ", filters));
                 foreach (var item in cloudTable.ExecuteQuery(query))
                 {
                     output.Add(ConvertFromTableEntity(item));
                 }
+
+                // Set total count
+                req.HttpContext.Response.Headers.Add("x-total-count", output.Count.ToString());
+
                 // Sorting isn't supported in Azure storage so we're just going to do our own here
                 if (req.Query.ContainsKey("_sort"))
                 {
@@ -104,11 +108,32 @@ namespace TestTableStorageOutput
                     var descending = req.Query.ContainsKey("_order") && req.Query["_order"] == "desc";
                     if (descending)
                     {
-                        return new OkObjectResult(output.OrderByDescending(i => i.ContainsKey(orderKey) ? i[orderKey] : null));
+                        output = output.OrderByDescending(i => i.ContainsKey(orderKey) ? i[orderKey] : null).ToList();
                     }
                     else
                     {
-                        return new OkObjectResult(output.OrderBy(i => i.ContainsKey(orderKey) ? i[orderKey] : null));
+                        output = output.OrderBy(i => i.ContainsKey(orderKey) ? i[orderKey] : null).ToList();
+                    }
+                }
+
+                // Do start and end offset
+                if (req.Query.ContainsKey("_start") && int.TryParse(req.Query["_start"][0], out int start) && start >=0)
+                {
+                    if (start > output.Count)
+                    {
+                        return new OkObjectResult(new List<Dictionary<string, object>>());
+                    }
+                    if (req.Query.ContainsKey("_end") && int.TryParse(req.Query["_end"][0], out int end) && end >= 0)
+                    {
+                        if (start > end)
+                        {
+                            return new BadRequestResult();
+                        }
+                        if (end > output.Count)
+                        {
+                            end = output.Count;
+                        }
+                        return new OkObjectResult(output.ToArray()[start..end]);
                     }
                 }
 
@@ -127,6 +152,25 @@ namespace TestTableStorageOutput
 
             return new OkObjectResult("");
         }
+        private static string BuildQueryComponent(string fieldName, string comparison, string value, Dictionary<string, TypeHints> typeHints)
+        {
+            if (!typeHints.ContainsKey(fieldName))
+            {
+                return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
+            }
+
+            if(typeHints[fieldName] == TypeHints.Boolean && bool.TryParse(value, out bool parsedBool))
+            {
+                return TableQuery.GenerateFilterConditionForBool(fieldName, comparison, parsedBool);
+            }
+            if (typeHints[fieldName] == TypeHints.Date && DateTime.TryParse( value, out DateTime parsedDate))
+            {
+                TableQuery.GenerateFilterConditionForDate(fieldName, comparison, parsedDate);
+            }
+
+            return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
+        }
+        
         private static DynamicTableEntity ConvertToTableEntity(string id, string partitionKey, Dictionary<string, object> data)
         {
             DynamicTableEntity dynamicEntity = new DynamicTableEntity(partitionKey, !string.IsNullOrEmpty(id) ? id : Guid.NewGuid().ToString());
@@ -187,5 +231,10 @@ namespace TestTableStorageOutput
             tmp.Add("id", item.RowKey);
             return tmp;
         }
+    }
+    public enum TypeHints
+    {
+        Boolean,
+        Date,
     }
 }
