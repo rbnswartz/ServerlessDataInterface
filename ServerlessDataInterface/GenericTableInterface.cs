@@ -102,9 +102,6 @@ namespace TestTableStorageOutput
                     output.Add(ConvertFromTableEntity(item));
                 }
 
-                // Set total count
-                req.HttpContext.Response.Headers.Add("x-total-count", output.Count.ToString());
-
                 // Do filtering that the db can't handle
                 foreach(var (queryItemKey, queryItem) in req.Query)
                 {
@@ -113,6 +110,9 @@ namespace TestTableStorageOutput
                         output = output.Where(i => i[queryItemKey[..^5].ToString()].ToString()?.Contains(queryItem[0], StringComparison.OrdinalIgnoreCase) ?? false).ToList();
                     }
                 }
+
+                // Set total count
+                req.HttpContext.Response.Headers.Add("x-total-count", output.Count.ToString());
 
                 // Sorting isn't supported in Azure storage so we're just going to do our own here
                 if (req.Query.ContainsKey("_sort"))
