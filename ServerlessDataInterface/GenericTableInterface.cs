@@ -54,6 +54,10 @@ namespace TestTableStorageOutput
                 var filters = new List<string>();
                 foreach(var (queryItemKey, queryItem) in req.Query)
                 {
+                    if (queryItemKey.EndsWith("_like"))
+                    {
+                        continue;
+                    }
                     if (queryItemKey.StartsWith("_"))
                     {
                         continue;
@@ -100,6 +104,15 @@ namespace TestTableStorageOutput
 
                 // Set total count
                 req.HttpContext.Response.Headers.Add("x-total-count", output.Count.ToString());
+
+                // Do filtering that the db can't handle
+                foreach(var (queryItemKey, queryItem) in req.Query)
+                {
+                    if (queryItemKey.EndsWith("_like"))
+                    {
+                        output = output.Where(i => i[queryItemKey[..^5].ToString()].ToString()?.Contains(queryItem[0], StringComparison.OrdinalIgnoreCase) ?? false).ToList();
+                    }
+                }
 
                 // Sorting isn't supported in Azure storage so we're just going to do our own here
                 if (req.Query.ContainsKey("_sort"))
