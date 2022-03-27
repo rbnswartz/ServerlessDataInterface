@@ -2,6 +2,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Cosmos.Table;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -42,7 +43,7 @@ namespace TestTableStorageOutput
                 {
                     var retrieveCommand = TableOperation.Retrieve<DynamicTableEntity>(partitionKey, id);
                     var result = cloudTable.Execute(retrieveCommand);
-                    return new OkObjectResult(ConvertFromTableEntity((DynamicTableEntity)result.Result));
+                    return new OkObjectResult(ConvertFromTableEntity((DynamicTableEntity)result.Result, currentTableHints));
                 }
                 // Get all
 
@@ -99,7 +100,7 @@ namespace TestTableStorageOutput
                 query.Where(string.Join(" and ", filters));
                 foreach (var item in cloudTable.ExecuteQuery(query))
                 {
-                    output.Add(ConvertFromTableEntity(item));
+                    output.Add(ConvertFromTableEntity(item, currentTableHints));
                 }
 
                 // Do filtering that the db can't handle
@@ -213,40 +214,46 @@ namespace TestTableStorageOutput
                     case DateTime convertedValue:
                         dynamicEntity[key] = new EntityProperty(convertedValue);
                         break;
-
+                    case JArray convertedValue:
+                        dynamicEntity[key] = new EntityProperty(String.Join(",", convertedValue.Select(i => i.ToString())));
+                        break;
                 }
             }
 
             return dynamicEntity;
         }
 
-        private static Dictionary<string, object> ConvertFromTableEntity(DynamicTableEntity item)
+        private static Dictionary<string, object> ConvertFromTableEntity(DynamicTableEntity item, Dictionary<string, TypeHints> typeHints)
         {
-            var tmp = new Dictionary<string, object>();
+            var output = new Dictionary<string, object>();
             foreach (var (key, field) in item.Properties)
             {
                 switch (field.PropertyType)
                 {
                     case EdmType.String:
-                        tmp.Add(key, field.StringValue);
+                        if (typeHints.ContainsKey(key) && typeHints[key] == TypeHints.ListString)
+                        {
+                            output[key] = field.StringValue.Split(",").ToList();
+                            break;
+                        }
+                        output.Add(key, field.StringValue);
                         break;
                     case EdmType.Boolean:
-                        tmp.Add(key, field.BooleanValue);
+                        output.Add(key, field.BooleanValue);
                         break;
                     case EdmType.Int32:
-                        tmp.Add(key, field.Int32Value);
+                        output.Add(key, field.Int32Value);
                         break;
                     case EdmType.DateTime:
-                        tmp.Add(key, field.DateTime);
+                        output.Add(key, field.DateTime);
                         break;
                     case EdmType.Double:
-                        tmp.Add(key, field.DoubleValue);
+                        output.Add(key, field.DoubleValue);
                         break;
-
                 }
             }
-            tmp.Add("id", item.RowKey);
-            return tmp;
+            output.Add("id", item.RowKey);
+            return output;
         }
     }
     public enum TypeHints
@@ -254,5 +261,6 @@ namespace TestTableStorageOutput
         Boolean,
         Date,
         Integer,
+        ListString,
     }
 }
