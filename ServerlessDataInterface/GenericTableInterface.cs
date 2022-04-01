@@ -211,6 +211,9 @@ namespace TestTableStorageOutput
                     case double convertedValue:
                         dynamicEntity[key] = new EntityProperty(convertedValue);
                         break;
+                    case long convertedValue:
+                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        break;
                     case DateTime convertedValue:
                         dynamicEntity[key] = new EntityProperty(convertedValue);
                         break;
@@ -243,6 +246,9 @@ namespace TestTableStorageOutput
                         break;
                     case EdmType.Int32:
                         output.Add(key, field.Int32Value);
+                        break;
+                    case EdmType.Int64:
+                        output.Add(key, field.Int64Value);
                         break;
                     case EdmType.DateTime:
                         output.Add(key, field.DateTime);
