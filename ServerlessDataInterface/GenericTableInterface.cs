@@ -10,11 +10,11 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace TestTableStorageOutput
+namespace ServerlessDataInterface
 {
     public static class GenericTableInterface
-    { 
-        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey, Dictionary<string,Dictionary<string,TypeHints>> typeHints)
+    {
+        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey, Dictionary<string, Dictionary<string, TypeHints>> typeHints, IAccessController accessController = null)
         {
             var currentTableHints = typeHints.ContainsKey(cloudTable.Name) ? typeHints[cloudTable.Name] : new Dictionary<string, TypeHints>();
 
@@ -22,6 +22,14 @@ namespace TestTableStorageOutput
             {
                 string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
                 var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(requestBody);
+                if (accessController != null)
+                {
+                    var accessControl = accessController.CheckAccess(cloudTable.Name, AccessType.Create, id, data);
+                    if (!accessControl.Allowed)
+                    {
+                        return new UnauthorizedResult();
+                    }
+                }
                 DynamicTableEntity dynamicEntity = ConvertToTableEntity(id, partitionKey, data);
                 var insertOperation = TableOperation.InsertOrReplace(dynamicEntity);
                 cloudTable.Execute(insertOperation);
@@ -31,9 +39,23 @@ namespace TestTableStorageOutput
             {
                 string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
                 var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(requestBody);
+
+                if (accessController != null)
+                {
+                    var accessControl = accessController.CheckAccess(cloudTable.Name, AccessType.Write, id, data);
+                    if (!accessControl.Allowed)
+                    {
+                        return new UnauthorizedResult();
+                    }
+                    if (!accessControl.AllFieldsAllowed)
+                    {
+                        data = RemoveAllButListedFields(data, accessControl.AllowedFields);
+                    }
+                }
+
                 DynamicTableEntity dynamicEntity = ConvertToTableEntity(id, partitionKey, data);
                 dynamicEntity.ETag = "*";
-                var insertOperation = TableOperation.Replace(dynamicEntity);
+                var insertOperation = TableOperation.Merge(dynamicEntity);
                 cloudTable.Execute(insertOperation);
                 return new OkResult();
             }
@@ -43,7 +65,20 @@ namespace TestTableStorageOutput
                 {
                     var retrieveCommand = TableOperation.Retrieve<DynamicTableEntity>(partitionKey, id);
                     var result = cloudTable.Execute(retrieveCommand);
-                    return new OkObjectResult(ConvertFromTableEntity((DynamicTableEntity)result.Result, currentTableHints));
+                    var getOutput = ConvertFromTableEntity((DynamicTableEntity)result.Result, currentTableHints);
+                    if (accessController != null)
+                    {
+                        var accessControl = accessController.CheckAccess(cloudTable.Name, AccessType.Read, id, getOutput);
+                        if (!accessControl.Allowed)
+                        {
+                            return new UnauthorizedResult();
+                        }
+                        if (!accessControl.AllFieldsAllowed)
+                        {
+                            getOutput = RemoveAllButListedFields(getOutput, accessControl.AllowedFields);
+                        }
+                    }
+                    return new OkObjectResult(getOutput);
                 }
                 // Get all
 
@@ -53,7 +88,7 @@ namespace TestTableStorageOutput
                 var query = new TableQuery<DynamicTableEntity>();
                 string filter = string.Empty;
                 var filters = new List<string>();
-                foreach(var (queryItemKey, queryItem) in req.Query)
+                foreach (var (queryItemKey, queryItem) in req.Query)
                 {
                     if (queryItemKey.EndsWith("_like"))
                     {
@@ -81,7 +116,7 @@ namespace TestTableStorageOutput
                     if (queryItemKey == "id")
                     {
                         var tmpFilter = string.Empty;
-                        foreach(var item in queryItem) 
+                        foreach (var item in queryItem)
                         {
                             if (tmpFilter == string.Empty)
                             {
@@ -104,12 +139,18 @@ namespace TestTableStorageOutput
                 }
 
                 // Do filtering that the db can't handle
-                foreach(var (queryItemKey, queryItem) in req.Query)
+                foreach (var (queryItemKey, queryItem) in req.Query)
                 {
                     if (queryItemKey.EndsWith("_like"))
                     {
                         output = output.Where(i => i[queryItemKey[..^5].ToString()].ToString()?.Contains(queryItem[0], StringComparison.OrdinalIgnoreCase) ?? false).ToList();
                     }
+                }
+
+                // Clean out allowed records
+                if (accessController != null)
+                {
+                    output = CleanAuthorizedRecords(cloudTable.Name, output, accessController);
                 }
 
                 // Set total count
@@ -131,7 +172,7 @@ namespace TestTableStorageOutput
                 }
 
                 // Do start and end offset
-                if (req.Query.ContainsKey("_start") && int.TryParse(req.Query["_start"][0], out int start) && start >=0)
+                if (req.Query.ContainsKey("_start") && int.TryParse(req.Query["_start"][0], out int start) && start >= 0)
                 {
                     if (start > output.Count)
                     {
@@ -159,6 +200,21 @@ namespace TestTableStorageOutput
                 {
                     return new BadRequestResult();
                 }
+                var retrieveCommand = TableOperation.Retrieve(partitionKey, id);
+                var retrieveResult = cloudTable.Execute(retrieveCommand);
+                if(retrieveResult.HttpStatusCode == 404)
+                {
+                    return new NotFoundResult();
+                }
+                var record = ConvertFromTableEntity((DynamicTableEntity)retrieveResult.Result, currentTableHints);
+                if (accessController != null)
+                {
+                    var accessControl = accessController.CheckAccess(cloudTable.Name, AccessType.Read, id);
+                    if (!accessControl.Allowed)
+                    {
+                        return new UnauthorizedResult();
+                    }
+                }
                 var deleteCommand = TableOperation.Delete(new DynamicTableEntity(partitionKey, id) { ETag = "*" });
                 cloudTable.Execute(deleteCommand);
                 return new OkResult();
@@ -173,22 +229,22 @@ namespace TestTableStorageOutput
                 return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
             }
 
-            if(typeHints[fieldName] == TypeHints.Boolean && bool.TryParse(value, out bool parsedBool))
+            if (typeHints[fieldName] == TypeHints.Boolean && bool.TryParse(value, out bool parsedBool))
             {
                 return TableQuery.GenerateFilterConditionForBool(fieldName, comparison, parsedBool);
             }
-            if (typeHints[fieldName] == TypeHints.Date && DateTime.TryParse( value, out DateTime parsedDate))
+            if (typeHints[fieldName] == TypeHints.Date && DateTime.TryParse(value, out DateTime parsedDate))
             {
                 return TableQuery.GenerateFilterConditionForDate(fieldName, comparison, parsedDate);
             }
-            if (typeHints[fieldName] == TypeHints.Integer && int.TryParse( value, out int parsedInt))
+            if (typeHints[fieldName] == TypeHints.Integer && int.TryParse(value, out int parsedInt))
             {
                 return TableQuery.GenerateFilterConditionForInt(fieldName, comparison, parsedInt);
             }
 
             return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
         }
-        
+
         private static DynamicTableEntity ConvertToTableEntity(string id, string partitionKey, Dictionary<string, object> data)
         {
             DynamicTableEntity dynamicEntity = new DynamicTableEntity(partitionKey, !string.IsNullOrEmpty(id) ? id : Guid.NewGuid().ToString());
@@ -218,12 +274,43 @@ namespace TestTableStorageOutput
                         dynamicEntity[key] = new EntityProperty(convertedValue);
                         break;
                     case JArray convertedValue:
-                        dynamicEntity[key] = new EntityProperty(String.Join(",", convertedValue.Select(i => i.ToString())));
+                        dynamicEntity[key] = new EntityProperty(string.Join(",", convertedValue.Select(i => i.ToString())));
                         break;
                 }
             }
 
             return dynamicEntity;
+        }
+        private static Dictionary<string,object> RemoveAllButListedFields(Dictionary<string,object> data, List<string> allowedFields)
+        {
+            var output = new Dictionary<string,object>(data.Count);
+            foreach(var (key,value) in data)
+            {
+                if (allowedFields.Contains(key))
+                {
+                    output.Add(key, value);
+                }
+            }
+            return output;
+        }
+        private static List<Dictionary<string,object>> CleanAuthorizedRecords(string tableName, List<Dictionary<string,object>> input, IAccessController accessController)
+        {
+            var output = new List<Dictionary<string,object>>(input.Count);
+            foreach(var row in input)
+            {
+                var access = accessController.CheckAccess(tableName, AccessType.Read, (string)row["id"], row);
+                if (!access.Allowed)
+                {
+                    continue;
+                }
+                if (access.AllFieldsAllowed)
+                {
+                    output.Add(row);
+                    continue;
+                }
+                output.Add(RemoveAllButListedFields(row, access.AllowedFields));
+            }
+            return output;
         }
 
         private static Dictionary<string, object> ConvertFromTableEntity(DynamicTableEntity item, Dictionary<string, TypeHints> typeHints)
