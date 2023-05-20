@@ -1,6 +1,6 @@
 ﻿using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Azure.Cosmos.Table;
+using Azure.Data.Tables;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
@@ -14,7 +14,7 @@ namespace ServerlessDataInterface
 {
     public static class GenericTableInterface
     {
-        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, CloudTable cloudTable, string id, string partitionKey, Dictionary<string, Dictionary<string, TypeHints>> typeHints, IAccessController accessController = null)
+        public static async Task<IActionResult> HandleRequestAsync(HttpRequest req, TableClient cloudTable, string id, string partitionKey, Dictionary<string, Dictionary<string, TypeHints>> typeHints, IAccessController accessController = null)
         {
             var currentTableHints = typeHints.ContainsKey(cloudTable.Name) ? typeHints[cloudTable.Name] : new Dictionary<string, TypeHints>();
 
@@ -30,9 +30,8 @@ namespace ServerlessDataInterface
                         return new UnauthorizedResult();
                     }
                 }
-                DynamicTableEntity dynamicEntity = ConvertToTableEntity(id, partitionKey, data);
-                var insertOperation = TableOperation.InsertOrReplace(dynamicEntity);
-                cloudTable.Execute(insertOperation);
+                TableEntity dynamicEntity = ConvertToTableEntity(id, partitionKey, data);
+                cloudTable.UpsertEntity(dynamicEntity);
                 return new OkResult();
             }
             else if (req.Method == "PATCH")
@@ -53,19 +52,16 @@ namespace ServerlessDataInterface
                     }
                 }
 
-                DynamicTableEntity dynamicEntity = ConvertToTableEntity(id, partitionKey, data);
-                dynamicEntity.ETag = "*";
-                var insertOperation = TableOperation.Merge(dynamicEntity);
-                cloudTable.Execute(insertOperation);
+                TableEntity dynamicEntity = ConvertToTableEntity(id, partitionKey, data);
+                cloudTable.UpdateEntity(dynamicEntity, new Azure.ETag("*"));
                 return new OkResult();
             }
             else if (req.Method == "GET")
             {
                 if (id != null)
                 {
-                    var retrieveCommand = TableOperation.Retrieve<DynamicTableEntity>(partitionKey, id);
-                    var result = cloudTable.Execute(retrieveCommand);
-                    var getOutput = ConvertFromTableEntity((DynamicTableEntity)result.Result, currentTableHints);
+                    var result = cloudTable.GetEntity<TableEntity>(partitionKey, id);
+                    var getOutput = ConvertFromTableEntity(result, currentTableHints);
                     if (accessController != null)
                     {
                         var accessControl = accessController.CheckAccess(cloudTable.Name, AccessType.Read, id, getOutput);
@@ -85,7 +81,6 @@ namespace ServerlessDataInterface
                 // Add total count so that the application knows what the total amount is
                 req.HttpContext.Response.Headers.Add("Access-Control-Expose-Headers", "x-total-count");
                 var output = new List<Dictionary<string, object>>();
-                var query = new TableQuery<DynamicTableEntity>();
                 string filter = string.Empty;
                 var filters = new List<string>();
                 foreach (var (queryItemKey, queryItem) in req.Query)
@@ -100,17 +95,17 @@ namespace ServerlessDataInterface
                     }
                     if (queryItemKey.EndsWith("_ne"))
                     {
-                        filters.Add(BuildQueryComponent(queryItemKey[..^3], QueryComparisons.NotEqual, queryItem[0], currentTableHints));
+                        filters.Add(BuildQueryComponent(queryItemKey[..^3], "ne", queryItem[0], currentTableHints));
                         continue;
                     }
                     if (queryItemKey.EndsWith("_gte"))
                     {
-                        filters.Add(BuildQueryComponent(queryItemKey[..^4], QueryComparisons.GreaterThanOrEqual, queryItem[0], currentTableHints));
+                        filters.Add(BuildQueryComponent(queryItemKey[..^4], "ge", queryItem[0], currentTableHints));
                         continue;
                     }
                     if (queryItemKey.EndsWith("_lte"))
                     {
-                        filters.Add(BuildQueryComponent(queryItemKey[..^4], QueryComparisons.LessThanOrEqual, queryItem[0], currentTableHints));
+                        filters.Add(BuildQueryComponent(queryItemKey[..^4], "le", queryItem[0], currentTableHints));
                         continue;
                     }
                     if (queryItemKey == "id")
@@ -120,20 +115,21 @@ namespace ServerlessDataInterface
                         {
                             if (tmpFilter == string.Empty)
                             {
-                                tmpFilter = TableQuery.GenerateFilterCondition("RowKey", QueryComparisons.Equal, item);
+                                tmpFilter =  $"RowKey eq '{item}'";
                             }
                             else
                             {
-                                tmpFilter = TableQuery.CombineFilters(tmpFilter, TableOperators.Or, TableQuery.GenerateFilterCondition("RowKey", QueryComparisons.Equal, item));
+                                tmpFilter = $"{tmpFilter} or RowKey eq '${item}'";
                             }
                         }
                         filters.Add(tmpFilter);
                         continue;
                     }
-                    filters.Add(BuildQueryComponent(queryItemKey, QueryComparisons.Equal, queryItem[0], currentTableHints));
+                    filters.Add(BuildQueryComponent(queryItemKey, "eq", queryItem[0], currentTableHints));
                 }
-                query.Where(string.Join(" and ", filters));
-                foreach (var item in cloudTable.ExecuteQuery(query))
+                var compiledQuery = string.Join(" and ", filters);
+                var multipleResult = filters.Count == 0 ? cloudTable.Query<TableEntity>() : cloudTable.Query<TableEntity>(compiledQuery);
+                foreach (var item in multipleResult)
                 {
                     output.Add(ConvertFromTableEntity(item, currentTableHints));
                 }
@@ -200,13 +196,12 @@ namespace ServerlessDataInterface
                 {
                     return new BadRequestResult();
                 }
-                var retrieveCommand = TableOperation.Retrieve(partitionKey, id);
-                var retrieveResult = cloudTable.Execute(retrieveCommand);
-                if(retrieveResult.HttpStatusCode == 404)
+                var retrieveResult = cloudTable.GetEntity<TableEntity>(partitionKey, id);
+                if(retrieveResult == null)
                 {
                     return new NotFoundResult();
                 }
-                var record = ConvertFromTableEntity((DynamicTableEntity)retrieveResult.Result, currentTableHints);
+                var record = ConvertFromTableEntity(retrieveResult, currentTableHints);
                 if (accessController != null)
                 {
                     var accessControl = accessController.CheckAccess(cloudTable.Name, AccessType.Read, id);
@@ -215,8 +210,7 @@ namespace ServerlessDataInterface
                         return new UnauthorizedResult();
                     }
                 }
-                var deleteCommand = TableOperation.Delete(new DynamicTableEntity(partitionKey, id) { ETag = "*" });
-                cloudTable.Execute(deleteCommand);
+                cloudTable.DeleteEntity(partitionKey, id);
                 return new OkResult();
             }
 
@@ -226,55 +220,56 @@ namespace ServerlessDataInterface
         {
             if (!typeHints.ContainsKey(fieldName))
             {
-                return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
+                return $"{fieldName} {comparison} '{value}'";
             }
 
             if (typeHints[fieldName] == TypeHints.Boolean && bool.TryParse(value, out bool parsedBool))
             {
-                return TableQuery.GenerateFilterConditionForBool(fieldName, comparison, parsedBool);
+                return $"{fieldName} {comparison} {(parsedBool ? "true" : "false")}";
             }
             if (typeHints[fieldName] == TypeHints.Date && DateTime.TryParse(value, out DateTime parsedDate))
             {
-                return TableQuery.GenerateFilterConditionForDate(fieldName, comparison, parsedDate);
+                return $"{fieldName} {comparison} {parsedDate}";
             }
             if (typeHints[fieldName] == TypeHints.Integer && int.TryParse(value, out int parsedInt))
             {
-                return TableQuery.GenerateFilterConditionForInt(fieldName, comparison, parsedInt);
+                return $"{fieldName} {comparison} {parsedInt}";
             }
 
-            return TableQuery.GenerateFilterCondition(fieldName, comparison, value);
+            return $"{fieldName} {comparison} '{value}'";
+;
         }
 
-        private static DynamicTableEntity ConvertToTableEntity(string id, string partitionKey, Dictionary<string, object> data)
+        private static TableEntity ConvertToTableEntity(string id, string partitionKey, Dictionary<string, object> data)
         {
-            DynamicTableEntity dynamicEntity = new DynamicTableEntity(partitionKey, !string.IsNullOrEmpty(id) ? id : Guid.NewGuid().ToString());
+            var dynamicEntity = new TableEntity(partitionKey, !string.IsNullOrEmpty(id) ? id : Guid.NewGuid().ToString());
             foreach (var (key, value) in data)
             {
                 switch (value)
                 {
                     case string convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case bool convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case int convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case float convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case double convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case long convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case DateTime convertedValue:
-                        dynamicEntity[key] = new EntityProperty(convertedValue);
+                        dynamicEntity[key] = convertedValue;
                         break;
                     case JArray convertedValue:
-                        dynamicEntity[key] = new EntityProperty(string.Join(",", convertedValue.Select(i => i.ToString())));
+                        dynamicEntity[key] = string.Join(",", convertedValue.Select(i => i.ToString()));
                         break;
                 }
             }
@@ -313,35 +308,23 @@ namespace ServerlessDataInterface
             return output;
         }
 
-        private static Dictionary<string, object> ConvertFromTableEntity(DynamicTableEntity item, Dictionary<string, TypeHints> typeHints)
+        private static Dictionary<string, object> ConvertFromTableEntity(TableEntity item, Dictionary<string, TypeHints> typeHints)
         {
             var output = new Dictionary<string, object>();
-            foreach (var (key, field) in item.Properties)
+            foreach (var (key, field) in item)
             {
-                switch (field.PropertyType)
+                switch (field)
                 {
-                    case EdmType.String:
+                    case string _:
                         if (typeHints.ContainsKey(key) && typeHints[key] == TypeHints.ListString)
                         {
-                            output[key] = field.StringValue.Split(",").ToList();
+                            output[key] = ((string)field).Split(",").ToList();
                             break;
                         }
-                        output.Add(key, field.StringValue);
+                        output.Add(key, (string)field);
                         break;
-                    case EdmType.Boolean:
-                        output.Add(key, field.BooleanValue);
-                        break;
-                    case EdmType.Int32:
-                        output.Add(key, field.Int32Value);
-                        break;
-                    case EdmType.Int64:
-                        output.Add(key, field.Int64Value);
-                        break;
-                    case EdmType.DateTime:
-                        output.Add(key, field.DateTime);
-                        break;
-                    case EdmType.Double:
-                        output.Add(key, field.DoubleValue);
+                    default:
+                        output.Add(key, field);
                         break;
                 }
             }
